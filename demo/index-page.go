@@ -1,387 +1,45 @@
 package demo
 
 import (
+	"bytes"
 	"context"
 	"encoding/csv"
+	"errors"
 	"fmt"
-	"io/fs"
+	"io"
 	"log/slog"
-	"maps"
-	"math"
-	"slices"
-	"strconv"
+	"math/rand/v2"
+	"net/http"
 	"strings"
-	"time"
 
 	"github.com/go-app-blazar/blazar/blazar"
 	"github.com/maxence-charriere/go-app/v11/pkg/app"
-	"github.com/ncruces/go-sqlite3/vfs/memdb"
-	"github.com/tekkamanendless/csd-tax-parcel-analysis/dataset"
-	"github.com/tekkamanendless/csd-tax-parcel-analysis/internal/database"
-	"github.com/tekkamanendless/csd-tax-parcel-analysis/simplechart"
-	"golang.org/x/text/language"
-	"golang.org/x/text/message"
-	"gorm.io/gorm"
 )
 
 type IndexPage struct {
 	app.Compo
 
-	db              *gorm.DB
-	schoolDistricts []string
-	taxRates        []TaxRate
+	count     uint
+	size      uint
+	targetURL string
 
-	selectedSchoolDistrict string
-
-	maximumRateMultiplier float64
-
-	loading                      bool
-	residentialRate              float64
-	nonResidentialRate           float64
-	nonResidentialRateMultiplier float64
-
-	residentialAppealsAmount float64 // This is the total amount of residential property value under appeal.  This amount will be subtracted from the true total.
-	residentialAppealsRate   float64 // This is the percentage of residential property value under appeal.
-
-	nonResidentialAppealsAmount float64 // This is the total amount of non-residential property value under appeal.  This amount will be subtracted from the true total.
-	nonResidentialAppealsRate   float64 // This is the percentage of non-residential property value under appeal.
-
-	propertyClassResults2024 []PropertyClassResult
-	propertyClassResults2025 []PropertyClassResult
-	totalTax                 float64
-
-	calculating                          bool
-	proposedResidentialRate              float64
-	proposedNonResidentialRate           float64
-	proposedNonResidentialRateMultiplier float64
-	proposedApartmentClass               string
-	proposedSpecialApartmentMultiplier   float64
-
-	proposedPropertyClassResults []PropertyClassResult
-	proposedTotalTax             float64
+	bingoCards []BingoCard
 }
 
-var printer *message.Printer = message.NewPrinter(language.English)
-
-func (c *IndexPage) query(query string) string {
-	var queryPrefix string
-	{
-		residentialPropertyClasses := []string{
-			"farmland",
-			"residential",
-		}
-
-		// countyrates AS (SELECT 0.21 AS votech2024, 0.0431 AS votech2025),
-
-		var districtRateClause string
-		{
-			var parts []string
-			for _, districtRate := range c.taxRates {
-				parts = append(parts, fmt.Sprintf("SELECT '%s' AS district, %f AS residential_rate, %f AS non_residential_rate", districtRate.SchoolDistrict, districtRate.ResidentialRate, districtRate.NonResidentialRate))
-			}
-			districtRateClause = strings.Join(parts, " UNION ")
-
-			districtRateClause = "districtrate AS (" + strings.TrimSpace(districtRateClause) + ")"
-		}
-
-		queryPrefix = "WITH\n" + districtRateClause + ",\n"
-		queryPrefix += `parceltax AS ( SELECT parcel.parcelid AS parcelid, CAST(100 * parcel.school_taxable * CASE WHEN parcel.property_class IN ('` + strings.Join(residentialPropertyClasses, "', '") + `') THEN districtrate.residential_rate ELSE districtrate.non_residential_rate END/100 AS INT) / 100 AS total FROM parcel INNER JOIN districtrate USING(district) )`
-
-		queryPrefix = strings.TrimSpace(queryPrefix)
-		queryPrefix = strings.TrimRight(queryPrefix, ",")
-		queryPrefix += "\n"
-	}
-
-	output := queryPrefix + query
-	slog.InfoContext(context.TODO(), "IndexPage: Query", "query", output)
-	return output
+type BingoCard struct {
+	Rows [][]string
 }
 
-func (c *IndexPage) proposedQuery(query string) string {
-	var queryPrefix string
-	{
-		residentialPropertyClasses := []string{
-			"farmland",
-			"residential",
-		}
-
-		var districtRateClause string
-		{
-			var parts []string
-			for _, districtRate := range c.taxRates {
-				if districtRate.SchoolDistrict == c.selectedSchoolDistrict {
-					parts = append(parts, fmt.Sprintf("SELECT '%s' AS district, %f AS residential_rate, %f AS non_residential_rate", districtRate.SchoolDistrict, c.proposedResidentialRate, c.proposedNonResidentialRate))
-				} else {
-					parts = append(parts, fmt.Sprintf("SELECT '%s' AS district, %f AS residential_rate, %f AS non_residential_rate", districtRate.SchoolDistrict, districtRate.ResidentialRate, districtRate.NonResidentialRate))
-				}
-			}
-			districtRateClause = strings.Join(parts, " UNION ")
-
-			districtRateClause = "districtrate AS (" + strings.TrimSpace(districtRateClause) + ")"
-		}
-
-		var apartmentExpression string
-		switch c.proposedApartmentClass {
-		case "residential":
-			apartmentExpression = "districtrate.residential_rate"
-		case "non-residential":
-			apartmentExpression = "districtrate.non_residential_rate"
-		case "special":
-			apartmentExpression = "districtrate.residential_rate * " + fmt.Sprintf("%0.4f", c.proposedSpecialApartmentMultiplier)
-		}
-
-		queryPrefix = "WITH\n" + districtRateClause + ",\n"
-		queryPrefix += `parceltax AS ( SELECT parcel.parcelid AS parcelid, CAST(100 * parcel.school_taxable * CASE WHEN parcel.property_class IN ('` + strings.Join(residentialPropertyClasses, "', '") + `') THEN districtrate.residential_rate WHEN parcel.property_class = 'apartment' THEN ` + apartmentExpression + ` ELSE districtrate.non_residential_rate END/100 AS INT) / 100 AS total FROM parcel INNER JOIN districtrate USING(district) )`
-		queryPrefix = strings.TrimSpace(queryPrefix)
-		queryPrefix = strings.TrimRight(queryPrefix, ",")
-		queryPrefix += "\n"
-	}
-
-	output := queryPrefix + query
-	slog.InfoContext(context.TODO(), "IndexPage: Proposed query", "query", output)
-	return output
-}
-
-type PropertyClassResult struct {
-	PropertyClass string  `gorm:"column:property_class"`
-	PropertyCount int64   `gorm:"column:property_count"`
-	PropertyValue float64 `gorm:"column:property_value"`
-	PropertyTax   float64 `gorm:"column:property_tax"`
-	AverageValue  float64 `gorm:"column:average_value"`
-	AverageTax    float64 `gorm:"column:average_tax"`
-	MedianValue   float64 `gorm:"column:median_value"`
-	MedianTax     float64 `gorm:"column:median_tax"`
-}
-
-type TaxRate struct {
-	SchoolDistrict     string  `gorm:"column:district"`
-	ResidentialRate    float64 `gorm:"column:residential_rate"`
-	NonResidentialRate float64 `gorm:"column:non_residential_rate"`
-}
-
-func (TaxRate) TableName() string {
-	return "taxrate"
-}
-
-type Parcel struct {
-	ParcelID       string  `gorm:"column:parcelid;primaryKey"`
-	SchoolDistrict string  `gorm:"column:district;index:district_and_property_class,priority:1"`
-	PropertyClass  string  `gorm:"column:property_class;index:district_and_property_class,priority:2"`
-	SchoolTaxable  float64 `gorm:"column:school_taxable"`
-	CountyTaxable  float64 `gorm:"column:county_taxable"`
-}
-
-func (Parcel) TableName() string {
-	return "parcel"
+func (c *BingoCard) String() string {
+	return fmt.Sprintf("%+v", *c)
 }
 
 func (c *IndexPage) OnMount(ctx app.Context) {
 	slog.InfoContext(ctx.Context, "IndexPage: OnMount")
 
-	c.maximumRateMultiplier = 2.0
-	c.proposedApartmentClass = "non-residential"
-	c.proposedSpecialApartmentMultiplier = 1.2
-	c.taxRates = []TaxRate{
-		{
-			SchoolDistrict:     "christina",
-			ResidentialRate:    0.6150,
-			NonResidentialRate: 1.2102,
-		},
-		{
-			SchoolDistrict:     "brandywine",
-			ResidentialRate:    0.5609,
-			NonResidentialRate: 1.0382,
-		},
-		{
-			SchoolDistrict:     "colonial",
-			ResidentialRate:    0.4523,
-			NonResidentialRate: 0.74294,
-		},
-		{
-			SchoolDistrict:     "redclay",
-			ResidentialRate:    0.5918,
-			NonResidentialRate: 0.99237,
-		},
-		{
-			SchoolDistrict:     "appoquinimink",
-			ResidentialRate:    0.57692,
-			NonResidentialRate: 1.15378,
-		},
-	}
-
-	memdb.Create("my_shared_db", nil)
-
-	db, err := database.New(ctx.Context, "sqlite3", "file:/my_shared_db?vfs=memdb&cache=shared&parseTime=true")
-	if err != nil {
-		slog.ErrorContext(ctx.Context, "IndexPage: Error creating database", "err", err)
-		return
-	}
-	err = db.AutoMigrate(&Parcel{})
-	if err != nil {
-		slog.ErrorContext(ctx.Context, "IndexPage: Error migrating database", "err", err)
-		return
-	}
-
-	var parcels []Parcel
-	schoolDistrictMap := map[string]bool{}
-	unhandledAbbrevations := map[string]uint{}
-
-	subFS, err := fs.Sub(dataset.EmbeddedFS, "embedded")
-	if err != nil {
-		slog.ErrorContext(ctx.Context, "IndexPage: Error creating sub FS", "err", err)
-		return
-	}
-
-	parseParcelFile := func(path string) error {
-		file, err := subFS.Open(path)
-		if err != nil {
-			return err
-		}
-		defer file.Close()
-
-		csvReader := csv.NewReader(file)
-		rows, err := csvReader.ReadAll()
-		if err != nil {
-			return err
-		}
-
-		header := rows[0]
-		slog.InfoContext(ctx.Context, "IndexPage: Header", "header", header)
-		rows = rows[1:]
-
-		headerToIndexMap := map[string]int{}
-		for i, header := range header {
-			headerToIndexMap[strings.ToLower(header)] = i
-		}
-
-		abbrevationToPropertyClassMap := map[string]string{
-			"r":  "residential",
-			"c":  "commercial",
-			"f":  "farmland",
-			"ec": "exempt commercial",
-			"er": "exempt residential",
-			"ef": "exempt farmland",
-			"i":  "industrial",
-			"u":  "utilities",
-			"a":  "apartment",
-		}
-
-		parcelIDIndex, ok := headerToIndexMap["prclid"]
-		if !ok {
-			return fmt.Errorf("prclid not found in header")
-		}
-		propertyClassIndex, ok := headerToIndexMap["propcl"]
-		if !ok {
-			return fmt.Errorf("prop class not found in header")
-		}
-		descriptionIndex, ok := headerToIndexMap["descript"]
-		if !ok {
-			return fmt.Errorf("descript not found in header")
-		}
-		schoolTaxableIndex, ok := headerToIndexMap["schooltaxable"]
-		if !ok {
-			schoolTaxableIndex, ok = headerToIndexMap["school taxable"]
-			if !ok {
-				return fmt.Errorf("schooltaxable not found in header")
-			}
-		}
-		countyTaxableIndex, ok := headerToIndexMap["countytaxable"]
-		if !ok {
-			countyTaxableIndex, ok = headerToIndexMap["county taxable"]
-			if !ok {
-				return fmt.Errorf("countytaxable not found in header")
-			}
-		}
-
-		for _, row := range rows {
-			parcel := Parcel{
-				ParcelID: row[parcelIDIndex],
-			}
-
-			if abbreviation := row[propertyClassIndex]; abbreviation != "" {
-				parcel.PropertyClass = abbrevationToPropertyClassMap[strings.ToLower(abbreviation)]
-				if parcel.PropertyClass == "" {
-					unhandledAbbrevations[abbreviation]++
-				}
-			}
-
-			description := strings.ToLower(row[descriptionIndex])
-			if strings.Contains(description, "christina") {
-				parcel.SchoolDistrict = "christina"
-			} else if strings.Contains(description, "brandywine") {
-				parcel.SchoolDistrict = "brandywine"
-			} else if strings.Contains(description, "colonial") {
-				parcel.SchoolDistrict = "colonial"
-			} else if strings.Contains(description, "red clay") {
-				parcel.SchoolDistrict = "redclay"
-			} else if strings.Contains(description, "appoquinimink") {
-				parcel.SchoolDistrict = "appoquinimink"
-			} else if strings.Contains(description, "smyrna") {
-				parcel.SchoolDistrict = "smyrna"
-			}
-
-			{
-				v, err := strconv.ParseUint(row[schoolTaxableIndex], 10, 64)
-				if err != nil {
-					return fmt.Errorf("Error parsing school taxable: %v", err)
-				}
-				parcel.SchoolTaxable = float64(v)
-			}
-
-			{
-				v, err := strconv.ParseUint(row[countyTaxableIndex], 10, 64)
-				if err != nil {
-					return fmt.Errorf("Error parsing county taxable: %v", err)
-				}
-				parcel.CountyTaxable = float64(v)
-			}
-
-			parcels = append(parcels, parcel)
-			schoolDistrictMap[parcel.SchoolDistrict] = true
-		}
-
-		return nil
-	}
-
-	fs.WalkDir(subFS, ".", func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			slog.ErrorContext(ctx.Context, "IndexPage: Error walking directory", "err", err)
-			return err
-		}
-		if d.IsDir() {
-			return nil
-		}
-		if strings.HasPrefix(path, "parcels.") && strings.HasSuffix(path, ".csv") {
-			slog.InfoContext(ctx.Context, "IndexPage: Found CSV file", "path", path)
-			err := parseParcelFile(path)
-			if err != nil {
-				slog.ErrorContext(ctx.Context, "IndexPage: Error parsing parcel file", "err", err)
-				return err
-			}
-		}
-		return nil
-	})
-
-	err = db.Transaction(func(db *gorm.DB) error {
-		err := db.CreateInBatches(parcels, 2000).Error
-		if err != nil {
-			return err
-		}
-		return nil
-	})
-	if err != nil {
-		slog.ErrorContext(ctx.Context, "IndexPage: Error creating parcels", "err", err)
-		return
-	}
-
-	c.db = db
-
-	c.schoolDistricts = slices.Collect(maps.Keys(schoolDistrictMap))
-	slices.Sort(c.schoolDistricts)
-
-	if len(unhandledAbbrevations) > 0 {
-		slog.ErrorContext(ctx.Context, "IndexPage: Unhandled abbreviations", "abbrevations", unhandledAbbrevations)
-	}
+	c.targetURL = ""
+	c.count = 5
+	c.size = 5
 }
 
 func (c *IndexPage) OnNav(ctx app.Context) {
@@ -389,757 +47,147 @@ func (c *IndexPage) OnNav(ctx app.Context) {
 }
 
 func (c *IndexPage) Render() app.UI {
-	columns := []blazar.TableColumn[PropertyClassResult]{
-		{
-			Name: "Property Class",
-			Value: func(row PropertyClassResult) any {
-				return row.PropertyClass
-			},
-		},
-		{
-			Name: "Property Count",
-			Value: func(row PropertyClassResult) any {
-				return row.PropertyCount
-			},
-			Type: blazar.TableColumnTypeNumber,
-		},
-		{
-			Name: "Property Value",
-			Value: func(row PropertyClassResult) any {
-				return row.PropertyValue
-			},
-			Format: func(value any) any {
-				return fmt.Sprintf("$%v", blazar.TableColumnFormatNumber(value))
-			},
-			Type: blazar.TableColumnTypeNumber,
-		},
-		{
-			Name: "Property Tax",
-			Value: func(row PropertyClassResult) any {
-				return row.PropertyTax
-			},
-			Format: func(value any) any {
-				return fmt.Sprintf("$%v", blazar.TableColumnFormatNumber(value))
-			},
-			Type: blazar.TableColumnTypeNumber,
-		},
-		{
-			Name: "Average Value",
-			Value: func(row PropertyClassResult) any {
-				if row.PropertyClass == "Total" {
-					return nil
-				}
-				return row.AverageValue
-			},
-			Format: func(value any) any {
-				if value == nil {
-					return nil
-				}
-				return fmt.Sprintf("$%v", blazar.TableColumnFormatNumber(value))
-			},
-			Type: blazar.TableColumnTypeNumber,
-		},
-		{
-			Name: "Average Tax",
-			Value: func(row PropertyClassResult) any {
-				if row.PropertyClass == "Total" {
-					return nil
-				}
-				return row.AverageTax
-			},
-			Format: func(value any) any {
-				if value == nil {
-					return nil
-				}
-				return fmt.Sprintf("$%v", blazar.TableColumnFormatNumber(value))
-			},
-			Type: blazar.TableColumnTypeNumber,
-		},
-		{
-			Name: "Median Value",
-			Value: func(row PropertyClassResult) any {
-				if row.PropertyClass == "Total" {
-					return nil
-				}
-				return row.MedianValue
-			},
-			Format: func(value any) any {
-				if value == nil {
-					return nil
-				}
-				return fmt.Sprintf("$%v", blazar.TableColumnFormatNumber(value))
-			},
-			Type: blazar.TableColumnTypeNumber,
-		},
-		{
-			Name: "Median Tax",
-			Value: func(row PropertyClassResult) any {
-				if row.PropertyClass == "Total" {
-					return nil
-				}
-				return row.MedianTax
-			},
-			Format: func(value any) any {
-				if value == nil {
-					return nil
-				}
-				return fmt.Sprintf("$%v", blazar.TableColumnFormatNumber(value))
-			},
-			Type: blazar.TableColumnTypeNumber,
-		},
-	}
-
-	propertyClassResults2025 := []PropertyClassResult{}
-	if len(c.propertyClassResults2025) > 0 {
-		propertyClassResults2025 = append(propertyClassResults2025, c.propertyClassResults2025...)
-		{
-			totalRow := PropertyClassResult{
-				PropertyClass: "Total",
-				PropertyCount: 0,
-				PropertyValue: 0,
-				PropertyTax:   0,
-			}
-			for _, propertyClassResult := range c.propertyClassResults2025 {
-				totalRow.PropertyCount += propertyClassResult.PropertyCount
-				totalRow.PropertyValue += propertyClassResult.PropertyValue
-				totalRow.PropertyTax += propertyClassResult.PropertyTax
-			}
-			propertyClassResults2025 = append(propertyClassResults2025, totalRow)
-		}
-	}
-
-	proposedPropertyClassResults := []PropertyClassResult{}
-	if len(c.proposedPropertyClassResults) > 0 {
-		proposedPropertyClassResults = append(proposedPropertyClassResults, c.proposedPropertyClassResults...)
-		{
-			totalRow := PropertyClassResult{
-				PropertyClass: "Total",
-				PropertyCount: 0,
-				PropertyValue: 0,
-				PropertyTax:   0,
-			}
-			for _, propertyClassResult := range c.propertyClassResults2025 {
-				totalRow.PropertyCount += propertyClassResult.PropertyCount
-				totalRow.PropertyValue += propertyClassResult.PropertyValue
-				totalRow.PropertyTax += propertyClassResult.PropertyTax
-			}
-			proposedPropertyClassResults = append(proposedPropertyClassResults, totalRow)
-		}
-	}
-
 	return blazar.Page().
 		Body(
-			app.Div().
+			blazar.Collapse().
+				Label("Configuration").
+				Open(true).
 				Body(
-					blazar.Select().
-						Label("School District").
-						Disabled(c.loading).
-						AllowedValue(func() []blazar.SelectOption {
-							options := []blazar.SelectOption{
-								{
-									Value:    "",
-									Label:    "Select a school district",
-									Disabled: true,
-								},
-								/*
-									{
-										Value: "all",
-										Label: "All school districts",
-									},
-								*/
-							}
-							for _, district := range c.schoolDistricts {
-								options = append(options, blazar.SelectOption{
-									Value: district,
-									Label: district,
-								})
-							}
-							return options
-						}()...).
-						Bind(&c.selectedSchoolDistrict).
-						On("change", func(ctx app.Context, e app.Event) {
-							// TODO: Load the known appeals rate when we have that data.
-						}),
+					blazar.Input[string]().
+						Label("Target URL").
+						Bind(&c.targetURL),
+					blazar.Input[uint]().
+						Label("Grid Size").
+						Bind(&c.size),
+					blazar.Input[uint]().
+						Label("Count").
+						Bind(&c.count),
 				),
-			app.If(c.selectedSchoolDistrict != "", func() app.UI {
+			blazar.Form().
+				Action(blazar.FormAction{
+					Name:     "Generate",
+					Function: c.generateBingoCards,
+				}),
+			app.If(len(c.bingoCards) > 0, func() app.UI {
 				return app.Div().
-					Style("display", "flex").
-					Style("flex-direction", "row").
-					Style("gap", "1em").
+					Class("bingo-cards").
 					Body(
-						blazar.Input[float64]().
-							Label("Residential Appeals Rate").
-							Suffix("%").
-							Min(0).
-							Max(100).
-							Disabled(c.loading).
-							Bind(&c.residentialAppealsRate).
-							On("change", func(ctx app.Context, e app.Event) {
-								residentialTotalTax := 0.0
-								nonResidentialTotalTax := 0.0
-								for _, propertyClassResult := range c.propertyClassResults2025 {
-									if slices.Contains([]string{"farmland", "residential"}, propertyClassResult.PropertyClass) {
-										residentialTotalTax += propertyClassResult.PropertyTax
-									} else {
-										nonResidentialTotalTax += propertyClassResult.PropertyTax
-									}
+						app.Range(c.bingoCards).Slice(func(i int) app.UI {
+							card := c.bingoCards[i]
+
+							uiCells := []app.UI{}
+							cellCount := 0
+							for _, row := range card.Rows {
+								for _, cell := range row {
+									uiCells = append(uiCells, app.Div().
+										Class("bingo-card-cell").
+										Text(cell))
+									cellCount++
 								}
+							}
 
-								c.residentialAppealsAmount = residentialTotalTax * c.residentialAppealsRate / 100.0
-							}),
-						blazar.Input[float64]().
-							Label("Residential Appeals Amount").
-							Prefix("$").
-							Min(0).
-							Disabled(c.loading || len(c.propertyClassResults2025) == 0).
-							Bind(&c.residentialAppealsAmount).
-							On("change", func(ctx app.Context, e app.Event) {
-								residentialTotalTax := 0.0
-								nonResidentialTotalTax := 0.0
-								for _, propertyClassResult := range c.propertyClassResults2025 {
-									if slices.Contains([]string{"farmland", "residential"}, propertyClassResult.PropertyClass) {
-										residentialTotalTax += propertyClassResult.PropertyTax
-									} else {
-										nonResidentialTotalTax += propertyClassResult.PropertyTax
-									}
-								}
-
-								c.residentialAppealsRate = 100.0 * c.residentialAppealsAmount / residentialTotalTax
-							}),
-					)
-			}),
-			app.If(c.selectedSchoolDistrict != "", func() app.UI {
-				return app.Div().
-					Style("display", "flex").
-					Style("flex-direction", "row").
-					Style("gap", "1em").
-					Body(
-						blazar.Input[float64]().
-							Label("Non-Residential Appeals Rate").
-							Suffix("%").
-							Min(0).
-							Max(100).
-							Disabled(c.loading).
-							Bind(&c.nonResidentialAppealsRate).
-							On("change", func(ctx app.Context, e app.Event) {
-								residentialTotalTax := 0.0
-								nonResidentialTotalTax := 0.0
-								for _, propertyClassResult := range c.propertyClassResults2025 {
-									if slices.Contains([]string{"farmland", "residential"}, propertyClassResult.PropertyClass) {
-										residentialTotalTax += propertyClassResult.PropertyTax
-									} else {
-										nonResidentialTotalTax += propertyClassResult.PropertyTax
-									}
-								}
-
-								c.nonResidentialAppealsAmount = nonResidentialTotalTax * c.nonResidentialAppealsRate / 100.0
-							}),
-						blazar.Input[float64]().
-							Label("Non-Residential Appeals Amount").
-							Prefix("$").
-							Min(0).
-							Disabled(c.loading || len(c.propertyClassResults2025) == 0).
-							Bind(&c.nonResidentialAppealsAmount).
-							On("change", func(ctx app.Context, e app.Event) {
-								residentialTotalTax := 0.0
-								nonResidentialTotalTax := 0.0
-								for _, propertyClassResult := range c.propertyClassResults2025 {
-									if slices.Contains([]string{"farmland", "residential"}, propertyClassResult.PropertyClass) {
-										residentialTotalTax += propertyClassResult.PropertyTax
-									} else {
-										nonResidentialTotalTax += propertyClassResult.PropertyTax
-									}
-								}
-
-								c.nonResidentialAppealsRate = 100.0 * c.nonResidentialAppealsAmount / nonResidentialTotalTax
-							}),
-					)
-			}),
-			app.If(c.selectedSchoolDistrict != "", func() app.UI {
-				return app.Div().
-					Body(
-						blazar.Button().
-							Label("Get Property Values").
-							Disabled(c.loading).
-							On("click", func(ctx app.Context, e app.Event) {
-								slog.InfoContext(ctx.Context, "IndexPage: Get Property Values clicked 1", "selectedSchoolDistrict", c.selectedSchoolDistrict)
-
-								c.loading = true
-								ctx.After(100*time.Millisecond, func(ctx app.Context) {
-									c.updateForNewSchoolDistrict(ctx)
-
-									c.loading = false
-									ctx.Update()
-								})
-
-								slog.InfoContext(ctx.Context, "IndexPage: Get Property Values clicked 2", "selectedSchoolDistrict", c.selectedSchoolDistrict)
-							}),
-						app.If(c.loading, func() app.UI {
-							return blazar.ProgressBar().
-								Indeterminate(true)
+							return app.Div().
+								Body(
+									app.H2().Text("Bingo"),
+									app.Div().
+										Class("bingo-card").
+										Style("grid-template-columns", fmt.Sprintf("repeat(%d, 1fr)", c.size)).
+										Style("grid-template-rows", fmt.Sprintf("repeat(%d, 1fr)", c.size)).
+										Body(
+											uiCells...,
+										),
+								)
 						}),
-					)
-			}),
-			app.If(len(propertyClassResults2025) > 0, func() app.UI {
-				return app.Div().
-					Body(
-						blazar.Table[PropertyClassResult]().
-							Title("2025").
-							Rows(propertyClassResults2025).
-							Columns(columns),
-						app.Div().
-							Class("row").
-							Style("padding-top", "1em").
-							Body(
-								simplechart.SimpleChart().
-									Label("Property Value").
-									Items(func() []simplechart.SimpleChartItem {
-										var items []simplechart.SimpleChartItem
-										totalValue := 0.0
-										for _, propertyClassResult := range c.propertyClassResults2025 {
-											totalValue += propertyClassResult.PropertyValue
-										}
-										for _, propertyClassResult := range c.propertyClassResults2025 {
-											items = append(items, simplechart.SimpleChartItem{
-												Label: propertyClassResult.PropertyClass,
-												Value: 100.0 * propertyClassResult.PropertyValue / totalValue,
-											})
-										}
-										return items
-									}()),
-								simplechart.SimpleChart().
-									Label("Property Tax").
-									Items(func() []simplechart.SimpleChartItem {
-										var items []simplechart.SimpleChartItem
-										totalValue := 0.0
-										for _, propertyClassResult := range c.propertyClassResults2025 {
-											totalValue += propertyClassResult.PropertyTax
-										}
-										for _, propertyClassResult := range c.propertyClassResults2025 {
-											items = append(items, simplechart.SimpleChartItem{
-												Label: propertyClassResult.PropertyClass,
-												Value: 100.0 * propertyClassResult.PropertyTax / totalValue,
-											})
-										}
-										return items
-									}()),
-							),
-						app.FieldSet().
-							Body(
-								app.Legend().Text("Current"),
-								blazar.Input[string]().
-									Label("Total Tax").
-									Prefix("$").
-									Disabled(true).
-									Value(printer.Sprintf("%.0f", c.totalTax)),
-								blazar.Input[float64]().
-									Label("Non-Residential Rate Multiplier").
-									Suffix("x").
-									Disabled(true).
-									Value(c.nonResidentialRateMultiplier),
-								blazar.Input[float64]().
-									Label("Residential Rate").
-									Suffix("%").
-									Disabled(true).
-									Value(c.residentialRate),
-								blazar.Input[float64]().
-									Label("Non-Residential Rate").
-									Suffix("%").
-									Disabled(true).
-									Value(c.nonResidentialRate),
-							),
-						app.FieldSet().
-							Body(
-								app.Legend().Text("Proposed"),
-								blazar.Input[float64]().
-									Label("Maximum Rate Multiplier").
-									Suffix("x").
-									Min(0).
-									Disabled(c.calculating).
-									Bind(&c.maximumRateMultiplier),
-								blazar.Input[float64]().
-									Label("Non-Residential Rate Multiplier").
-									Suffix("x").
-									Min(0).
-									Max(c.maximumRateMultiplier).
-									Disabled(c.calculating).
-									Bind(&c.proposedNonResidentialRateMultiplier),
-								blazar.Input[float64]().
-									Label("Residential Rate").
-									Suffix("%").
-									Min(0).
-									Max(100).
-									Disabled(c.calculating).
-									Bind(&c.proposedResidentialRate),
-								blazar.Input[float64]().
-									Label("Non-Residential Rate").
-									Suffix("%").
-									Min(0).
-									Max(100).
-									Disabled(c.calculating).
-									Bind(&c.proposedNonResidentialRate),
-								blazar.Select().
-									Label("Apartments Are Classifed As").
-									Disabled(c.calculating).
-									Bind(&c.proposedApartmentClass).
-									AllowedValue(
-										blazar.SelectOption{},
-										blazar.SelectOption{
-											Label: "Residential",
-											Value: "residential",
-										},
-										blazar.SelectOption{
-											Label: "Non-Residential",
-											Value: "non-residential",
-										},
-										blazar.SelectOption{
-											Label: "Special New Thing",
-											Value: "special",
-										},
-									),
-								blazar.Input[float64]().
-									Label("Special Apartment Multiplier").
-									Suffix("x").
-									Min(0).
-									Disabled(c.calculating).
-									Bind(&c.proposedSpecialApartmentMultiplier),
-							),
-						blazar.Button().
-							Label("Calculate").
-							Disabled(c.calculating).
-							On("click", func(ctx app.Context, e app.Event) {
-								slog.InfoContext(ctx.Context, "IndexPage: Calculate button clicked")
-
-								c.calculating = true
-								ctx.After(100*time.Millisecond, func(ctx app.Context) {
-									c.refigureProposal(ctx)
-									c.calculateProposedPropertyClassResults(ctx)
-
-									c.calculating = false
-									ctx.Update()
-								})
-							}),
-						app.If(c.calculating, func() app.UI {
-							return blazar.ProgressBar().
-								Indeterminate(true)
-						}),
-					)
-			}),
-			app.If(len(proposedPropertyClassResults) > 0, func() app.UI {
-				return app.Div().
-					Body(
-						blazar.Input[string]().
-							Label("Proposed Total Tax").
-							Prefix("$").
-							Disabled(true).
-							Value(printer.Sprintf("%.0f", c.proposedTotalTax)),
-						blazar.Table[PropertyClassResult]().
-							Rows(proposedPropertyClassResults).
-							Columns(columns),
-						app.Div().
-							Class("row").
-							Style("padding-top", "1em").
-							Body(
-								simplechart.SimpleChart().
-									Label("Property Value").
-									Items(func() []simplechart.SimpleChartItem {
-										var items []simplechart.SimpleChartItem
-										totalValue := 0.0
-										for _, propertyClassResult := range c.proposedPropertyClassResults {
-											totalValue += propertyClassResult.PropertyValue
-										}
-										for _, propertyClassResult := range c.proposedPropertyClassResults {
-											items = append(items, simplechart.SimpleChartItem{
-												Label: propertyClassResult.PropertyClass,
-												Value: 100.0 * propertyClassResult.PropertyValue / totalValue,
-											})
-										}
-										return items
-									}()),
-								simplechart.SimpleChart().
-									Label("Property Tax").
-									Items(func() []simplechart.SimpleChartItem {
-										var items []simplechart.SimpleChartItem
-										totalValue := 0.0
-										for _, propertyClassResult := range c.proposedPropertyClassResults {
-											totalValue += propertyClassResult.PropertyTax
-										}
-										for _, propertyClassResult := range c.proposedPropertyClassResults {
-											items = append(items, simplechart.SimpleChartItem{
-												Label: propertyClassResult.PropertyClass,
-												Value: 100.0 * propertyClassResult.PropertyTax / totalValue,
-											})
-										}
-										return items
-									}()),
-							),
 					)
 			}),
 		)
 }
 
-func (c *IndexPage) updateForNewSchoolDistrict(ctx app.Context) {
-	slog.InfoContext(ctx.Context, "IndexPage: updateForNewSchoolDistrict", "selectedSchoolDistrict", c.selectedSchoolDistrict)
+func (c *IndexPage) generateBingoCards(ctx app.Context) {
+	slog.InfoContext(ctx.Context, "IndexPage: generateBingoCards")
 
-	if c.selectedSchoolDistrict == "" {
-		return
-	}
-
-	query := c.query(`
-SELECT
-parcel.property_class,
-COUNT(*) AS property_count,
-SUM(parcel.school_taxable) AS property_value,
-SUM(parceltax.total) AS property_tax,
-AVG(parcel.school_taxable) AS average_value,
-AVG(parceltax.total) AS average_tax,
-MEDIAN(parcel.school_taxable) AS median_value,
-MEDIAN(parceltax.total) AS median_tax
-FROM parcel
-INNER JOIN parceltax USING(parcelid)
-WHERE 1
-AND parcel.district = ?
-AND parcel.property_class NOT LIKE '%exempt%'
-AND parcel.school_taxable > 0
-GROUP BY parcel.property_class
-ORDER BY parcel.property_class
-`)
-	propertyClassResults := make([]PropertyClassResult, 0, 100_000)
-	err := c.db.Raw(query, c.selectedSchoolDistrict).
-		Find(&propertyClassResults).
-		Error
+	options, err := c.fetchOptions(ctx.Context)
 	if err != nil {
-		slog.ErrorContext(ctx.Context, "IndexPage: Error executing query", "err", err)
+		slog.ErrorContext(ctx.Context, "IndexPage: generateBingoCards", "error", err)
 		return
 	}
 
-	ctx.Dispatch(func(ctx app.Context) {
-		c.propertyClassResults2025 = propertyClassResults
-
-		c.totalTax = 0
-		for _, propertyClassResult := range c.propertyClassResults2025 {
-			c.totalTax += propertyClassResult.PropertyTax
-		}
-
-		{
-			residentialTotalTax := 0.0
-			nonResidentialTotalTax := 0.0
-			for _, propertyClassResult := range c.propertyClassResults2025 {
-				if slices.Contains([]string{"farmland", "residential"}, propertyClassResult.PropertyClass) {
-					residentialTotalTax += propertyClassResult.PropertyTax
-				} else {
-					nonResidentialTotalTax += propertyClassResult.PropertyTax
-				}
-			}
-
-			if c.residentialAppealsAmount == 0 && c.residentialAppealsRate > 0 {
-				c.residentialAppealsAmount = residentialTotalTax * c.residentialAppealsRate / 100.0
-			}
-			if c.nonResidentialAppealsAmount == 0 && c.nonResidentialAppealsRate > 0 {
-				c.nonResidentialAppealsAmount = nonResidentialTotalTax * c.nonResidentialAppealsRate / 100.0
-			}
-		}
-
-		c.totalTax -= c.residentialAppealsAmount
-		c.totalTax -= c.nonResidentialAppealsAmount
-
-		var districtRate TaxRate
-		for _, testRate := range c.taxRates {
-			if testRate.SchoolDistrict == c.selectedSchoolDistrict {
-				districtRate = testRate
-				break
-			}
-		}
-		if districtRate.SchoolDistrict == "" {
-			slog.ErrorContext(ctx.Context, "IndexPage: updateForNewSchoolDistrict: District rate not found", "selectedSchoolDistrict", c.selectedSchoolDistrict)
-			return
-		}
-
-		c.nonResidentialRateMultiplier = districtRate.NonResidentialRate / districtRate.ResidentialRate
-		c.residentialRate = districtRate.ResidentialRate
-		c.nonResidentialRate = districtRate.NonResidentialRate
-
-		c.proposedNonResidentialRateMultiplier = c.nonResidentialRateMultiplier
-		c.proposedResidentialRate = c.residentialRate
-		c.proposedNonResidentialRate = c.nonResidentialRate
-	})
-}
-
-func (c *IndexPage) refigureProposal(ctx app.Context) {
-	slog.InfoContext(ctx.Context, "IndexPage: apartments are residential", "apartmentsAreResidential", c.proposedApartmentClass)
-
-	slog.InfoContext(ctx.Context, "IndexPage: rates", "residentialRate", c.residentialRate, "nonResidentialRateMultiplier", c.nonResidentialRateMultiplier)
-
-	iterations := 0
-	for {
-		iterations++
-		if iterations > 100 {
-			slog.ErrorContext(ctx.Context, "IndexPage: refigureProposal: Too many iterations", "iterations", iterations)
-			return
-		}
-		slog.ErrorContext(ctx.Context, "IndexPage: refigureProposal", "iterations", iterations)
-
-		if c.proposedNonResidentialRateMultiplier > c.maximumRateMultiplier {
-			c.proposedNonResidentialRateMultiplier = c.maximumRateMultiplier
-		}
-
-		residentialTotalValue := 0.0
-		apartmentTotalValue := 0.0
-		nonResidentialTotalValue := 0.0
-		for _, propertyClassResult := range c.propertyClassResults2025 {
-			if slices.Contains([]string{"farmland", "residential"}, propertyClassResult.PropertyClass) {
-				residentialTotalValue += propertyClassResult.PropertyValue
-			} else if propertyClassResult.PropertyClass == "apartment" {
-				apartmentTotalValue += propertyClassResult.PropertyValue
-			} else {
-				nonResidentialTotalValue += propertyClassResult.PropertyValue
-			}
-		}
-
-		residentialTotalValue *= (1.0 - c.residentialAppealsRate/100.0)
-		nonResidentialTotalValue *= (1.0 - c.nonResidentialAppealsRate/100.0)
-		apartmentTotalValue *= (1.0 - c.nonResidentialAppealsRate/100.0)
-
-		totalValue := residentialTotalValue + nonResidentialTotalValue + apartmentTotalValue
-
-		slog.InfoContext(ctx.Context, "IndexPage: original values", "residentialTotalValue", printer.Sprintf("$%.0f", residentialTotalValue), "nonResidentialTotalValue", printer.Sprintf("$%.0f", nonResidentialTotalValue), "apartmentTotalValue", printer.Sprintf("$%.0f", apartmentTotalValue))
-		slog.InfoContext(ctx.Context, "IndexPage: total value", "totalValue", printer.Sprintf("$%.0f", totalValue))
-
-		currentApartmentMultiplier := c.nonResidentialRateMultiplier
-		var proposedApartmentMultiplier float64
-		switch c.proposedApartmentClass {
-		case "residential":
-			proposedApartmentMultiplier = 1.0
-		case "non-residential":
-			proposedApartmentMultiplier = c.proposedNonResidentialRateMultiplier
-		case "special":
-			proposedApartmentMultiplier = c.proposedSpecialApartmentMultiplier
-		}
-
-		testRevenue := c.residentialRate/100.0*residentialTotalValue + c.nonResidentialRateMultiplier*c.residentialRate/100.0*nonResidentialTotalValue + currentApartmentMultiplier*c.residentialRate/100.0*apartmentTotalValue
-		slog.InfoContext(ctx.Context, "IndexPage: revenue", "oldRevenue", printer.Sprintf("$%.0f", c.totalTax), "original testRevenue", printer.Sprintf("$%.0f", testRevenue))
-
-		newResidentialTotalValue := residentialTotalValue
-		newNonResidentialTotalValue := nonResidentialTotalValue
-		newApartmentTotalValue := apartmentTotalValue
-
-		slog.InfoContext(ctx.Context, "IndexPage: new values", "newResidentialTotalValue", printer.Sprintf("$%.0f", newResidentialTotalValue), "newNonResidentialTotalValue", printer.Sprintf("$%.0f", newNonResidentialTotalValue))
-
-		trueTotalTax := 0.0
-		for _, propertyClassResult := range c.propertyClassResults2025 {
-			trueTotalTax += propertyClassResult.PropertyTax
-		}
-
-		//
-		// Revenue = Residential Value * Residential Rate / 100 + Non-Residential Value * Non-Residential Rate / 100
-		// Revenue = Residential Value * Residential Rate / 100 + Non-Residential Value * Multiplier * Residential Rate / 100
-		// Revenue = Residential Rate / 100 * ( Residential Value + Non-Residential Value * Multiplier )
-		// Revenue * 100 = Residential Rate * ( Residential Value + Non-Residential Value * Multiplier )
-		// Revenue * 100 / Residential Rate = Residential Value + Non-Residential Value * Multiplier
-		// Revenue * 100 / Residential Rate - Residential Value = Non-Residential Value * Multiplier
-		// ( Revenue * 100 / Residential Rate - Residential Value ) / Non-Residential Value = Multiplier
-		//
-		//
-		// Revenue = Residential Rate / 100 * ( Residential Value + Non-Residential Value * Multiplier )
-		// Revenue * 100 = Residential Rate * ( Residential Value + Non-Residential Value * Multiplier )
-		// Revenue * 100 / ( Residential Value + Non-Residential Value * Multiplier ) = Residential Rate
-		//
-		// Revenue = Residential Value * Residential Rate / 100 + Non-Residential Value * Multiplier * Residential Rate / 100 + Apartment Value * Apartment Multiplier * Residential Rate / 100
-		// Revenue = Residential Rate / 100 * ( Residential Value + Non-Residential Value * Multiplier + Apartment Value * Apartment Multiplier )
-		// Revenue * 100 / Residential Rate = Residential Value + Non-Residential Value * Multiplier + Apartment Value * Apartment Multiplier
-		// ( Revenue * 100 / Residential Rate ) - Residential Value - Apartment Value * Apartment Multiplier = Non-Residential Value * Multiplier
-		// ( ( Revenue * 100 / Residential Rate ) - Residential Value - Apartment Value * Apartment Multiplier ) / Non-Residential Value = Multiplier
-
-		newMultiplier := (c.totalTax*100.0/c.proposedResidentialRate - newResidentialTotalValue - newApartmentTotalValue*proposedApartmentMultiplier) / newNonResidentialTotalValue
-		slog.InfoContext(ctx.Context, "IndexPage: new multiplier", "newMultiplier", fmt.Sprintf("%.4f", newMultiplier))
-		slog.InfoContext(ctx.Context, "IndexPage: new rates", "residentialRate", fmt.Sprintf("%.4f", c.proposedResidentialRate), "nonResidentialRate", fmt.Sprintf("%.4f", c.proposedResidentialRate*newMultiplier))
-
-		if newMultiplier <= c.maximumRateMultiplier {
-			newRevenue := c.proposedResidentialRate/100.0*newResidentialTotalValue + newMultiplier*c.proposedResidentialRate/100.0*newNonResidentialTotalValue
-			slog.InfoContext(ctx.Context, "IndexPage: revenue", "oldRevenue", printer.Sprintf("$%.0f", c.totalTax), "newRevenue", printer.Sprintf("$%.0f", newRevenue))
-
-			c.proposedNonResidentialRateMultiplier = newMultiplier
-		} else {
-			c.proposedNonResidentialRateMultiplier = c.maximumRateMultiplier
-			c.proposedResidentialRate = c.totalTax * 100.0 / (newResidentialTotalValue + newNonResidentialTotalValue*c.maximumRateMultiplier + newApartmentTotalValue*proposedApartmentMultiplier)
-		}
-		c.proposedNonResidentialRate = c.proposedResidentialRate * c.proposedNonResidentialRateMultiplier
-
-		testRevenue = c.proposedResidentialRate/100.0*residentialTotalValue + c.proposedNonResidentialRateMultiplier*c.proposedResidentialRate/100.0*nonResidentialTotalValue + proposedApartmentMultiplier*c.proposedResidentialRate/100.0*apartmentTotalValue
-		slog.InfoContext(ctx.Context, "IndexPage: revenue", "oldRevenue", printer.Sprintf("$%.0f", c.totalTax), "final testRevenue", printer.Sprintf("$%.0f", testRevenue))
-
-		if math.Abs((testRevenue-c.totalTax)/c.totalTax) < 0.005 {
-			break
-		}
-
-		if testRevenue < c.totalTax {
-			if math.Abs((testRevenue-c.totalTax)/c.totalTax) < 0.5 {
-				c.proposedNonResidentialRateMultiplier = c.maximumRateMultiplier
-			}
-			c.proposedResidentialRate = c.proposedResidentialRate * 1.005
-		} else {
-			c.proposedResidentialRate = c.proposedResidentialRate * 0.995
-		}
+	numberOfCells := c.size * c.size
+	if len(options) < int(numberOfCells) {
+		slog.ErrorContext(ctx.Context, "IndexPage: generateBingoCards", "error", "not enough options")
+		return
 	}
 
-	slog.InfoContext(ctx.Context, "IndexPage: refigureProposal: done", "iterations", iterations)
-	slog.InfoContext(ctx.Context, "IndexPage: refigureProposal: new rates", "residentialRate", fmt.Sprintf("%.4f", c.proposedResidentialRate), "nonResidentialRate", fmt.Sprintf("%.4f", c.proposedNonResidentialRate), "nonResidentialRateMultiplier", fmt.Sprintf("%.4f", c.proposedNonResidentialRateMultiplier))
+	c.bingoCards = []BingoCard{}
+	usedCards := map[string]bool{}
+	for range c.count {
+		bingoCard := BingoCard{
+			Rows: [][]string{},
+		}
+
+		cardOptions := make([]string, len(options))
+		copy(cardOptions, options)
+		rand.Shuffle(len(cardOptions), func(i, j int) {
+			cardOptions[i], cardOptions[j] = cardOptions[j], cardOptions[i]
+		})
+
+		if len(cardOptions) > int(numberOfCells) {
+			cardOptions = cardOptions[:numberOfCells]
+		}
+
+		i := 0
+		for range c.size {
+			row := []string{}
+			for range c.size {
+				row = append(row, cardOptions[i])
+				i++
+			}
+			bingoCard.Rows = append(bingoCard.Rows, row)
+		}
+		usedCards[bingoCard.String()] = true
+		c.bingoCards = append(c.bingoCards, bingoCard)
+	}
 
 	ctx.Update()
 }
 
-func (c *IndexPage) calculateProposedPropertyClassResults(ctx app.Context) {
-	slog.InfoContext(ctx.Context, "IndexPage: calculateProposedPropertyClassResults")
+func (c *IndexPage) fetchOptions(ctx context.Context) ([]string, error) {
+	slog.InfoContext(ctx, "IndexPage: fetchOptions")
 
-	if c.selectedSchoolDistrict == "" {
-		return
+	if c.targetURL == "" {
+		return nil, errors.New("target URL is required")
 	}
 
-	c.proposedPropertyClassResults = []PropertyClassResult{}
-
-	query := c.proposedQuery(`
-SELECT
-parcel.property_class,
-COUNT(*) AS property_count,
-SUM(parcel.school_taxable) AS property_value,
-SUM(parceltax.total) AS property_tax,
-AVG(parcel.school_taxable) AS average_value,
-AVG(parceltax.total) AS average_tax,
-MEDIAN(parcel.school_taxable) AS median_value,
-MEDIAN(parceltax.total) AS median_tax
-FROM parcel
-INNER JOIN parceltax USING(parcelid)
-WHERE 1
-AND parcel.district = ?
-AND parcel.property_class NOT LIKE '%exempt%'
-GROUP BY parcel.property_class
-ORDER BY parcel.property_class
-`)
-	propertyClassResults := make([]PropertyClassResult, 0, 100_000)
-	err := c.db.Raw(query, c.selectedSchoolDistrict).
-		Find(&propertyClassResults).
-		Error
+	resp, err := http.Get(c.targetURL)
 	if err != nil {
-		slog.ErrorContext(ctx.Context, "IndexPage: calculateProposedPropertyClassResults: Error executing query", "err", err)
-		return
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
 	}
 
-	ctx.Dispatch(func(ctx app.Context) {
-		c.proposedPropertyClassResults = propertyClassResults
+	contentType := resp.Header.Get("Content-Type")
+	if contentType == "" {
+		return nil, errors.New("content type is required")
+	}
 
-		proposedResidentialTax := 0.0
-		proposedNonResidentialTax := 0.0
-		proposedApartmentTax := 0.0
-		for _, propertyClassResult := range c.proposedPropertyClassResults {
-			if slices.Contains([]string{"farmland", "residential"}, propertyClassResult.PropertyClass) {
-				proposedResidentialTax += propertyClassResult.PropertyTax
-			} else if propertyClassResult.PropertyClass == "apartment" {
-				proposedApartmentTax += propertyClassResult.PropertyTax
-			} else {
-				proposedNonResidentialTax += propertyClassResult.PropertyTax
-			}
+	contentType = strings.Split(contentType, ";")[0]
+	switch contentType {
+	case "text/csv":
+		csvReader := csv.NewReader(bytes.NewReader(body))
+		rows, err := csvReader.ReadAll()
+		if err != nil {
+			return nil, err
 		}
-
-		c.proposedTotalTax = proposedResidentialTax*(1.0-c.residentialAppealsRate/100.0) + proposedNonResidentialTax*(1.0-c.nonResidentialAppealsRate/100.0) + proposedApartmentTax*(1.0-c.nonResidentialAppealsRate/100.0)
-	})
+		options := []string{}
+		for _, row := range rows {
+			options = append(options, row[0])
+		}
+		return options, nil
+	default:
+		return nil, errors.New("content type is not supported")
+	}
 }

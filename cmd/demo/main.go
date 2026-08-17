@@ -16,9 +16,8 @@ import (
 	"github.com/lmittmann/tint"
 	"github.com/mattn/go-isatty"
 	"github.com/maxence-charriere/go-app/v11/pkg/app"
-	"github.com/tekkamanendless/csd-tax-parcel-analysis/demo"
-	"github.com/tekkamanendless/csd-tax-parcel-analysis/mainplugin"
-	"github.com/tekkamanendless/csd-tax-parcel-analysis/simplechart"
+	"github.com/tekkamanendless/bingo-generator/demo"
+	"github.com/tekkamanendless/bingo-generator/mainplugin"
 )
 
 // The main function is the entry point where the app is configured and started.
@@ -117,7 +116,7 @@ func main() {
 			Path: "/",
 			Component: func() app.Composer {
 				return blazar.MainLayout().
-					HeadlineText("New Castle County School Tax Calculator")
+					HeadlineText("Bingo Card Generator")
 			},
 			Children: []router.Route{
 				{
@@ -144,14 +143,11 @@ func main() {
 	app.RunWhenOnBrowser()
 
 	blazarApp := blazarapp.NewApp(blazarapp.Config{
-		Name:        "New Castle County School Tax Calculator",
-		Description: "New Castle County School Tax Calculator",
-		Title:       "New Castle County School Tax Calculator",
+		Name:        "Bingo Card Generator",
+		Description: "Bingo Card Generator",
+		Title:       "Bingo Card Generator",
 	})
 	blazarApp.AddPlugin(blazarapp.DefaultPlugins()...)
-	blazarApp.AddPlugin(simplechart.NewPlugin(simplechart.Config{
-		Location: "/web/simplechart/",
-	}))
 	blazarApp.AddPlugin(mainplugin.NewPlugin(mainplugin.Config{
 		Location: "/web/main/",
 	}))
