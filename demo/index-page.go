@@ -23,7 +23,8 @@ type IndexPage struct {
 	size      uint
 	targetURL string
 
-	bingoCards []BingoCard
+	errorMessage string
+	bingoCards   []BingoCard
 }
 
 type BingoCard struct {
@@ -37,9 +38,13 @@ func (c *BingoCard) String() string {
 func (c *IndexPage) OnMount(ctx app.Context) {
 	slog.InfoContext(ctx.Context, "IndexPage: OnMount")
 
-	c.targetURL = ""
 	c.count = 5
 	c.size = 5
+	c.targetURL = ""
+
+	ctx.ObserveState("count", &c.count)
+	ctx.ObserveState("size", &c.size)
+	ctx.ObserveState("target-url", &c.targetURL)
 }
 
 func (c *IndexPage) OnNav(ctx app.Context) {
@@ -53,21 +58,37 @@ func (c *IndexPage) Render() app.UI {
 				Label("Configuration").
 				Open(true).
 				Body(
-					blazar.Input[string]().
-						Label("Target URL").
-						Bind(&c.targetURL),
-					blazar.Input[uint]().
-						Label("Grid Size").
-						Bind(&c.size),
-					blazar.Input[uint]().
-						Label("Count").
-						Bind(&c.count),
+					blazar.Form().
+						Body(
+							blazar.Input[string]().
+								Label("Target URL").
+								Bind(&c.targetURL).
+								On("change", func(ctx app.Context, e app.Event) {
+									ctx.SetState("target-url", c.targetURL).Persist()
+								}),
+							blazar.Input[uint]().
+								Label("Grid Size").
+								Bind(&c.size).
+								On("change", func(ctx app.Context, e app.Event) {
+									ctx.SetState("size", c.size).Persist()
+								}),
+							blazar.Input[uint]().
+								Label("Count").
+								Bind(&c.count).
+								On("change", func(ctx app.Context, e app.Event) {
+									ctx.SetState("count", c.count).Persist()
+								}),
+						).
+						Action(blazar.FormAction{
+							Name:     "Generate",
+							Function: c.generateBingoCards,
+						}),
 				),
-			blazar.Form().
-				Action(blazar.FormAction{
-					Name:     "Generate",
-					Function: c.generateBingoCards,
-				}),
+			app.If(c.errorMessage != "", func() app.UI {
+				return blazar.StatusBar().
+					Bad().
+					Text(c.errorMessage)
+			}),
 			app.If(len(c.bingoCards) > 0, func() app.UI {
 				return app.Div().
 					Class("bingo-cards").
@@ -108,16 +129,17 @@ func (c *IndexPage) generateBingoCards(ctx app.Context) {
 
 	options, err := c.fetchOptions(ctx.Context)
 	if err != nil {
-		slog.ErrorContext(ctx.Context, "IndexPage: generateBingoCards", "error", err)
+		c.errorMessage = err.Error()
 		return
 	}
 
 	numberOfCells := c.size * c.size
 	if len(options) < int(numberOfCells) {
-		slog.ErrorContext(ctx.Context, "IndexPage: generateBingoCards", "error", "not enough options")
+		c.errorMessage = fmt.Sprintf("Not enough options (only got %d, needed %d)", len(options), numberOfCells)
 		return
 	}
 
+	c.errorMessage = ""
 	c.bingoCards = []BingoCard{}
 	usedCards := map[string]bool{}
 	for range c.count {
@@ -188,6 +210,6 @@ func (c *IndexPage) fetchOptions(ctx context.Context) ([]string, error) {
 		}
 		return options, nil
 	default:
-		return nil, errors.New("content type is not supported")
+		return nil, fmt.Errorf("content type %q is not supported", contentType)
 	}
 }
