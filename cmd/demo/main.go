@@ -183,6 +183,7 @@ func main() {
 	if port == "" {
 		port = "8001"
 	}
+	slog.InfoContext(ctx, "Starting server on port", "port", port)
 	if err := http.ListenAndServe(":"+port, wrapper); err != nil {
 		slog.ErrorContext(ctx, "Could not start server", "err", err)
 		os.Exit(1)

@@ -19,9 +19,10 @@ import (
 type IndexPage struct {
 	app.Compo
 
-	count     uint
-	size      uint
-	targetURL string
+	count        uint
+	size         uint
+	targetURL    string
+	centerIsFree bool
 
 	errorMessage string
 	bingoCards   []BingoCard
@@ -38,10 +39,12 @@ func (c *BingoCard) String() string {
 func (c *IndexPage) OnMount(ctx app.Context) {
 	slog.InfoContext(ctx.Context, "IndexPage: OnMount")
 
+	c.centerIsFree = true
 	c.count = 5
 	c.size = 5
 	c.targetURL = ""
 
+	ctx.ObserveState("center-is-free", &c.centerIsFree)
 	ctx.ObserveState("count", &c.count)
 	ctx.ObserveState("size", &c.size)
 	ctx.ObserveState("target-url", &c.targetURL)
@@ -71,6 +74,13 @@ func (c *IndexPage) Render() app.UI {
 								Bind(&c.size).
 								On("change", func(ctx app.Context, e app.Event) {
 									ctx.SetState("size", c.size).Persist()
+								}),
+							blazar.Input[bool]().
+								Label("Center is free").
+								Disabled(c.size%2 == 0).
+								Bind(&c.centerIsFree).
+								On("change", func(ctx app.Context, e app.Event) {
+									ctx.SetState("center-is-free", c.centerIsFree).Persist()
 								}),
 							blazar.Input[uint]().
 								Label("Count").
@@ -134,6 +144,9 @@ func (c *IndexPage) generateBingoCards(ctx app.Context) {
 	}
 
 	numberOfCells := c.size * c.size
+	if c.size%2 == 1 && c.centerIsFree {
+		numberOfCells--
+	}
 	if len(options) < int(numberOfCells) {
 		c.errorMessage = fmt.Sprintf("Not enough options (only got %d, needed %d)", len(options), numberOfCells)
 		return
@@ -158,11 +171,15 @@ func (c *IndexPage) generateBingoCards(ctx app.Context) {
 		}
 
 		i := 0
-		for range c.size {
+		for rowIndex := range c.size {
 			row := []string{}
-			for range c.size {
-				row = append(row, cardOptions[i])
-				i++
+			for columnIndex := range c.size {
+				if c.size%2 == 1 && c.centerIsFree && rowIndex == c.size/2 && rowIndex == columnIndex {
+					row = append(row, "FREE")
+				} else {
+					row = append(row, cardOptions[i])
+					i++
+				}
 			}
 			bingoCard.Rows = append(bingoCard.Rows, row)
 		}

@@ -6,7 +6,6 @@
     
     /* Sizing and borders */
     width: 100%;
-    max-width: 500px;
     aspect-ratio: 1 / 1; /* Keeps the card perfectly square */
 
     margin-bottom: 1em;
