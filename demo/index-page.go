@@ -147,9 +147,8 @@ func (c *IndexPage) generateBingoCards(ctx app.Context) {
 	if c.size%2 == 1 && c.centerIsFree {
 		numberOfCells--
 	}
-	if len(options) < int(numberOfCells) {
-		c.errorMessage = fmt.Sprintf("Not enough options (only got %d, needed %d)", len(options), numberOfCells)
-		return
+	for len(options) < int(numberOfCells) {
+		options = append(options, "")
 	}
 
 	c.errorMessage = ""
